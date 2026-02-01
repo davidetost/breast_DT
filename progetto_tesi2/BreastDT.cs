@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using UnityEngine;
 
 public class TumorVisualization : MonoBehaviour
@@ -29,10 +30,21 @@ public class TumorVisualization : MonoBehaviour
 
     private bool initialized = false;
 
-    // ❌ NON facciamo nulla allo start
-    void Start() {}
+    
+    void Start() 
+    {
+        if (leftTumor != null) 
+        {
+            leftTumor.localScale = Vector3.zero; // Scala a zero per sicurezza
+            leftTumor.gameObject.SetActive(false); // Disattiva l'oggetto
+        }
 
-    // 🔐 Inizializzazione SOLO quando arrivano dati reali
+        if (rightTumor != null) 
+        {
+            rightTumor.localScale = Vector3.zero;
+            rightTumor.gameObject.SetActive(false);
+        }
+    }
     public void InitializeFromData()
     {
         if (initialized) return;
@@ -40,15 +52,24 @@ public class TumorVisualization : MonoBehaviour
         if (leftTumor != null)
         {
             SetupTumor(leftTumor, ref leftMat);
+            print("Initialized left tumor");
+           // Debug.LogWarning("[TumorVisualization] Left tumor initialized.");
         }
 
+        else 
+        {
+            //Debug.LogWarning("[TumorVisualization] Left tumor Transform is not null.");
+        }
         if (rightTumor != null)
         {
             SetupTumor(rightTumor, ref rightMat);
         }
-
+        else 
+        {
+          //  Debug.LogWarning("[TumorVisualization] Right tumor Transform is not null.");
+        }
         initialized = true;
-        Debug.Log("[TumorVisualization] Initialized from first data");
+        //Debug.Log("[TumorVisualization] Initialized from first data");
     }
 
     private void SetupTumor(Transform tumor, ref Material mat)

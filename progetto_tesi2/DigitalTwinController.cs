@@ -5,10 +5,14 @@ using uPLibrary.Networking.M2Mqtt;
 using uPLibrary.Networking.M2Mqtt.Messages;
 using System.Collections.Generic;
 
+// --- CLASSI DATI ---
 [Serializable]
 public class TumorData
 {
     public float radius;
+    public float cellularity;
+    public float drug_level;
+    public string status;
 }
 
 [Serializable]
@@ -19,30 +23,38 @@ public class TumorsPayload
 }
 
 [Serializable]
+public class MetaPayload
+{
+    public string patient_id;
+    public string source;
+}
+
+[Serializable]
 public class MQTTMessage
 {
+    public string type;
     public double timestamp;
+    public MetaPayload meta;
     public TumorsPayload tumors;
 }
 
 public class DigitalTwinController : MonoBehaviour
 {
     [Header("MQTT")]
-    public string brokerAddress = "localhost";
+    public string brokerAddress = "192.168.1.143"; // IP della VM
     public int brokerPort = 1883;
     public string tumorTopic = "digitaltwin/breast/tumor";
-    public string statusTopic = "digitaltwin/system/status";
-    public string bootstrapTopic = "digitaltwin/breast/bootstrap";
+    public string actionTopic = "digitaltwin/breast/action";
 
-    [Header("References")]
-    public TumorVisualization tumorVisualizer;
+    [Header("Visuals")]
+    public GameObject leftSphere;   // Trascina la Sfera SX qui
+    public GameObject rightSphere;  // Trascina la Sfera DX qui
+    public float sphereScaleFactor = 0.5f; // Moltiplicatore grandezza
 
     [Header("Debug")]
     public bool debugLogs = true;
 
     private MqttClient client;
-    private bool visualizationReady = false;
-
     private Queue<string> messageQueue = new Queue<string>();
     private object queueLock = new object();
 
@@ -55,27 +67,21 @@ public class DigitalTwinController : MonoBehaviour
     {
         try
         {
-            client = new MqttClient(brokerAddress, brokerPort, false, null, null, MqttSslProtocols.None);
+            client = new MqttClient(brokerAddress);
             client.MqttMsgPublishReceived += OnMessage;
-
             string id = "UnityTwin_" + UnityEngine.Random.Range(1000, 9999);
             client.Connect(id);
-
+            
             client.Subscribe(
-                new string[] { tumorTopic, statusTopic },
-                new byte[] {
-                    MqttMsgBase.QOS_LEVEL_AT_MOST_ONCE,
-                    MqttMsgBase.QOS_LEVEL_AT_MOST_ONCE
-                }
+                new string[] { tumorTopic, "digitaltwin/system/status" },
+                new byte[] { MqttMsgBase.QOS_LEVEL_AT_MOST_ONCE, MqttMsgBase.QOS_LEVEL_AT_MOST_ONCE }
             );
 
-            if (debugLogs)
-                Debug.Log("[DigitalTwin] Connected to MQTT");
-
+            if (debugLogs) Debug.Log($"[DigitalTwin] Connesso a {brokerAddress}");
         }
         catch (Exception e)
         {
-            Debug.LogError("[DigitalTwin] MQTT error: " + e.Message);
+            Debug.LogError("[DigitalTwin] Errore connessione: " + e.Message);
         }
     }
 
@@ -90,6 +96,7 @@ public class DigitalTwinController : MonoBehaviour
 
     void Update()
     {
+        // 1. Elabora messaggi dalla coda
         lock (queueLock)
         {
             while (messageQueue.Count > 0)
@@ -97,60 +104,70 @@ public class DigitalTwinController : MonoBehaviour
                 ProcessMessage(messageQueue.Dequeue());
             }
         }
+
+        // 2. Input Terapia (Barra Spaziatrice)
+        // NOTA: Se questo da errore, vai su Edit -> Project Settings -> Player -> Active Input Handling -> Imposta su "Both"
+        if (Input.GetKeyDown(KeyCode.Space))
+        {
+            SendTherapyCommand();
+        }
     }
 
     void ProcessMessage(string msg)
     {
-        if (msg == "READY")
-        {
-            SendBootstrap();
-            return;
-        }
+        // Ignora messaggi di stato o bootstrap per la visualizzazione
+        if (msg.Contains("READY") || msg.Contains("BOOTSTRAP")) return;
 
-        MQTTMessage data;
         try
         {
-            data = JsonUtility.FromJson<MQTTMessage>(msg);
+            MQTTMessage data = JsonUtility.FromJson<MQTTMessage>(msg);
+
+            if (data != null && data.tumors != null)
+            {
+                UpdateVisuals(data.tumors);
+            }
         }
         catch
         {
-            return;
+            // Ignora errori di parsing su messaggi non pertinenti
         }
-
-        if (data?.tumors == null) return;
-
-        if (!visualizationReady)
-        {
-            tumorVisualizer.InitializeFromData();
-            visualizationReady = true;
-        }
-
-        if (data.tumors.left != null)
-            tumorVisualizer.UpdateLeftTumor(data.tumors.left.radius);
-
-        if (data.tumors.right != null)
-            tumorVisualizer.UpdateRightTumor(data.tumors.right.radius);
     }
 
-    void SendBootstrap()
+    void UpdateVisuals(TumorsPayload tumors)
     {
-        string bootstrap = @"{
-            ""meta"": { ""source"": ""unity"" },
-            ""initial_state"": {
-                ""left_tumor_radius"": 0.5,
-                ""right_tumor_radius"": 0.7
-            }
-        }";
+        // --- SFERA SINISTRA ---
+        if (leftSphere != null && tumors.left != null)
+        {
+            // Aggiorna Dimensione
+            float scale = tumors.left.radius * 2 * sphereScaleFactor;
+            leftSphere.transform.localScale = new Vector3(scale, scale, scale);
 
-        client.Publish(
-            bootstrapTopic,
-            Encoding.UTF8.GetBytes(bootstrap),
-            MqttMsgBase.QOS_LEVEL_AT_MOST_ONCE,
-            false
-        );
+            // Aggiorna Colore (Verde = Cura, Rosso = Male)
+            Renderer rend = leftSphere.GetComponent<Renderer>();
+            if (rend != null)
+                rend.material.color = (tumors.left.status == "shrinking") ? Color.green : Color.red;
+        }
 
-        if (debugLogs)
-            Debug.Log("[DigitalTwin] Bootstrap sent");
+        // --- SFERA DESTRA ---
+        if (rightSphere != null && tumors.right != null)
+        {
+            float scale = tumors.right.radius * 2 * sphereScaleFactor;
+            rightSphere.transform.localScale = new Vector3(scale, scale, scale);
+
+            Renderer rend = rightSphere.GetComponent<Renderer>();
+            if (rend != null)
+                rend.material.color = (tumors.right.status == "shrinking") ? Color.green : Color.red;
+        }
+    }
+
+    void SendTherapyCommand()
+    {
+        if (client != null && client.IsConnected)
+        {
+            string jsonPayload = "{\"type\": \"MANUAL_THERAPY\", \"dosage\": 0.8}";
+            client.Publish(actionTopic, Encoding.UTF8.GetBytes(jsonPayload), MqttMsgBase.QOS_LEVEL_EXACTLY_ONCE, false);
+            Debug.Log("[Unity] 💉 Terapia Inviata!");
+        }
     }
 
     void OnApplicationQuit()
