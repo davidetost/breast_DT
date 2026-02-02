@@ -33,42 +33,57 @@ class TumorModel:
         current_time = time.time()
         dt = current_time - self.last_update_time
 
-        #growth is defined by Gompertz model: dR/dt = alpha * R * ln (K/R)
-        if 0< self.radius < self.k:
-            growth_rate =self.alpha * self.radius * math.log(self.k / self.radius)
-        else:
-            growth_rate =0.0
+        prev_radius = self.radius
 
-        #drug_effect is the effect of the drug (Hill equation with real parameters), while death is emax *(dose/(IC50 + Dose))* Radius
-        if self.drug_efficacy >0:
-            drug_effect = self.emax * self.radius * self.drug_efficacy / (self.ic50 + self.drug_efficacy)
-            death_rate = drug_effect* self.radius
+        # Gompertz growth: dR/dt = alpha * R * ln(K/R)
+        if 0 < self.radius < self.k:
+            growth_rate = self.alpha * self.radius * math.log(self.k / self.radius)
         else:
-            death_rate =0.0 
+            growth_rate = 0.0
 
-        #integration 
-        delta_radius = (growth_rate - death_rate) * dt
-        self.radius += delta_radius
+        # integrate growth
+        self.radius += growth_rate * dt
+
+        # therapy: exponential shrink proportional to drug efficacy (handled by helper)
+        if self.drug_efficacy > 0:
+            self.apply_therapy(dt)
 
         # drug effect decay
         if self.drug_efficacy > 0:
             self.drug_efficacy -= (self.drug_decay * dt)
-            if self.drug_level <0: self.drug_efficacy =0.0
+            if self.drug_efficacy < 0:
+                self.drug_efficacy = 0.0
 
-        #physical limits
+        # physical limits and bookkeeping
         self.radius = max(0.1, min(self.radius, self.k))
         self.last_update_time = current_time
 
+        delta_radius = self.radius - prev_radius
+
         return {
             "radius": round(self.radius, 4),
-            "cellularity": round(self.alpha*100, 2),
+            "cellularity": round(self.alpha * 100, 2),
             "drug_level": round(self.drug_efficacy, 4),
             "status": "growing" if delta_radius > 0 else "shrinking"
         }
+
+    def apply_therapy(self, dt):
+        """Apply exponential shrink due to therapy for the given timestep dt.
+
+        Returns the absolute shrink amount (old_radius - new_radius).
+        """
+        if self.drug_efficacy <= 0:
+            return 0.0
+        therapy_strength = self.emax * (self.drug_efficacy / (self.ic50 + self.drug_efficacy))
+        shrink_factor = math.exp(-therapy_strength * dt)
+        old_radius = self.radius
+        self.radius *= shrink_factor
+        return max(0.0, old_radius - self.radius)
     
-    def inject_drug(self, amount):
+    def inject_drug(self, amount=0.5):
         self.drug_efficacy += float(amount)
-        if self.drug_efficacy > 2.0: self.drug_efficacy =2.0
+        if self.drug_efficacy > 2.0:
+            self.drug_efficacy = 2.0
 
 
 # =====================
@@ -131,11 +146,7 @@ class EdgeServer:
         else:
             print(f"[MQTT] Connection failed with code {reason_code}")
 
-        try:
-            data = json.loads(msg.payload.decode())
-        except Exception as e:
-            print(f"[MQTT] JSON non valido: {e}")
-            return
+        # no payload to parse on connect
     def on_message(self, client, userdata, msg):
         try:
             payload_str = msg.payload.decode()
@@ -155,9 +166,20 @@ class EdgeServer:
                 print("[Server] Invalid BOOTSTRAP message")
             
         if msg.topic == self.topic_action:
-            print("[Server] Received action message, Drug injection...")
-            if "left" in self.tumors: self.tumors["left"].inject_drug()
-            if "right" in self.tumors: self.tumors["right"].inject_drug()
+            print("[Server] Received action message.")
+            # Expect payload like: {"type":"ACTION","action":"INJECT","dose":0.5,"target":"left"}
+            amount = float(data.get("dose", data.get("amount", 0.5)))
+            targets = data.get("target", "both")
+            if isinstance(targets, str):
+                if targets == "both":
+                    targets = ["left", "right"]
+                else:
+                    targets = [targets]
+
+            for t in targets:
+                if t in self.tumors:
+                    self.tumors[t].inject_drug(amount)
+                    print(f"[Server] Injected dose={amount} to {t}")
 
 
                 
