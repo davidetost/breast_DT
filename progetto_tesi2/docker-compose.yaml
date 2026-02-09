@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  grpc-server:
+    build:
+      context: ./grpc-server
+      dockerfile: Dockerfile
+    container_name: dt_grpc_server
+    ports:
+      - "50051:50051"
+    networks:
+      - grpc-network
+
+  envoy:
+    image: envoyproxy/envoy:v1.29-latest # Consiglio la 1.29 o 1.30 per stabilità
+    container_name: dt_envoy
+    ports:
+      - "8080:8080"
+      - "9901:9901"
+    volumes:
+      - ./envoy/envoy.yaml:/etc/envoy/envoy.yaml
+    networks:
+      - grpc-network
+
+networks:
+  grpc-network:
+    driver: bridge
