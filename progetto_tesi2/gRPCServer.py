@@ -8,13 +8,15 @@ import breast_dt_pb2_grpc
 # Same Gompertz Model as the one used for MQTT
 class TumorModel:
     def __init__(self, r, c):
-        self.radius = r
-        self.alpha = c* 0.005
+        self.radius = float(r)
+        self.alpha = float(c) * 0.005
         self.k = 30.0
         self.drug_efficacy = 0.0
         self.drug_decay=0.02
         self.emax=0.05
-
+        self.ic50 = base_ic50 * max(1.0, 1.0 + resistance_factor)
+        resistance_factor = (float(c) / 20.0)
+        base_ic50 = 0.2
         self.last_update_time = time.time()
 
     def update(self):
@@ -67,10 +69,23 @@ class DigitalTwinService(breast_dt_pb2_grpc.DigitalTwinService):
             r_l= self.left.update()
             r_r= self.right.update()
 
+            left_data = breast_dt_pb2.TumorData(
+                radius=r_l["radius"],
+                cellularity=r_l["cellularity"],
+                drug_level=r_l["drug_level"],
+                status=r_l["status"]
+            )
+            right_data = breast_dt_pb2.TumorData(
+                radius=r_r["radius"],
+                cellularity=r_r["cellularity"],
+                drug_level=r_r["drug_level"],
+                status=r_r["status"]
+            )
+
             #a protobuf message is created with the updated tumor status and sent to the client
-            response = breast_dt_pb2.TumorStatus(
-                left_radius=r_l["radius"],
-                right_radius=r_r["radius"],
+            response = breast_dt_pb2.TumorState(
+                left_tumor=left_data,
+                right_tumor=right_data,
                 drug_level= self.left.drug_efficacy,
                 timestamp = time.time(),
                 status = "GROWING"
