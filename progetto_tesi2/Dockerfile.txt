@@ -1,0 +1,23 @@
+# Use a lightweight official Python image
+FROM python:3.9-slim
+
+# Set the working directory inside the container
+WORKDIR /app
+
+# 1. Copy and install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 2. Copy the .proto file and the server script
+COPY digitaltwin.proto .
+COPY grpc_server.py .
+
+# 3. MAGIC STEP: Generate Python code from .proto
+# This creates digitaltwin_pb2.py and digitaltwin_pb2_grpc.py inside the image
+RUN python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. digitaltwin.proto
+
+# 4. Expose the gRPC port
+EXPOSE 50051
+
+# 5. Start the server
+CMD ["python", "grpc_server.py"]
