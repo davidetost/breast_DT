@@ -1,256 +1,399 @@
 import threading
 import time
-import os
-import json
-import math
-import zmq
+import os 
 import grpc
-import paho.mqtt.client as mqtt
+import zmq
+import math
 from concurrent import futures
+import paho.mqtt.client as mqtt
+import json
 
-# Import gRPC
 import breast_dt_pb2
 import breast_dt_pb2_grpc
 
-# ==========================
-# 1. MODELLO TUMORALE (Classe Base)
-# ==========================
+# ═══════════════════════════════════════════════════════════════════
+# TUMOR MODEL
+# ═══════════════════════════════════════════════════════════════════
 class TumorModel:
-    def __init__(self, r=0.5, c=10.0):
+    def __init__(self, r, c):
         self.radius = float(r)
-        if self.radius < 0.1: self.radius = 0.1
+        if self.radius < 0.1: 
+            self.radius = 0.1
+        
         self.alpha = float(c) * 0.005
         self.k = 30.0
         self.drug_efficacy = 0.0
         self.drug_decay = 0.02
         self.emax = 0.05
-        self.ic50 = 0.2 * max(1.0, 1.0 + (float(c) / 20.0))
+        
+        resistance_factor = (float(c) / 20.0)
+        base_ic50 = 0.2
+        self.ic50 = base_ic50 * max(1.0, 1.0 + resistance_factor)
+        
         self.last_update_time = time.time()
 
     def update(self):
         now = time.time()
         dt = now - self.last_update_time
-        
-        # Gompertz
-        if 0 < self.radius < self.k:
-            growth = self.alpha * self.radius * math.log(self.k / self.radius)
-        else:
-            growth = 0.0
-            
-        # Terapia
-        death = 0.0
-        if self.drug_efficacy > 0:
-            death = (self.emax * self.radius * self.drug_efficacy) / (self.ic50 + self.drug_efficacy) * self.radius
-            self.drug_efficacy = max(0, self.drug_efficacy - (self.drug_decay * dt))
 
-        self.radius = max(0.1, min(self.k, self.radius + (growth - death) * dt))
+        if 0 < self.radius < self.k:
+            growth_rate = self.alpha * self.radius * math.log(self.k / self.radius)
+        else:
+            growth_rate = 0.0
+
+        death_rate = 0.0
+        if self.drug_efficacy > 0:
+            drug_effect = self.emax * self.radius * self.drug_efficacy / (self.ic50 + self.drug_efficacy)
+            death_rate = drug_effect * self.radius
+
+        delta_radius = (growth_rate - death_rate) * dt
+        self.radius += delta_radius
+
+        if self.drug_efficacy > 0:
+            self.drug_efficacy -= (self.drug_decay * dt)
+            if self.drug_efficacy < 0: 
+                self.drug_efficacy = 0.0
+
+        self.radius = max(0.1, min(self.radius, self.k))
         self.last_update_time = now
-        
+
         return {
             "radius": round(self.radius, 4),
-            "status": "growing" if growth > death else "shrinking"
+            "cellularity": round(self.alpha * 100, 2),
+            "drug_level": round(self.drug_efficacy, 4),
+            "status": "growing" if (growth_rate > death_rate) else "shrinking"
         }
-
-    def inject(self, amount):
+    
+    def inject_drug(self, amount):
         self.drug_efficacy += float(amount)
-        if self.drug_efficacy > 2.0: self.drug_efficacy = 2.0
+        if self.drug_efficacy > 2.0:
+            self.drug_efficacy = 2.0
 
-# ==========================
-# 2. STATO SEPARATO (3 MONDI PARALLELI)
-# ==========================
-# Ogni protocollo ha il SUO paziente personale da gestire
-simulations = {
-    "MQTT": {"left": TumorModel(), "right": TumorModel()},
-    "ZMQ":  {"left": TumorModel(), "right": TumorModel()},
-    "GRPC": {"left": TumorModel(), "right": TumorModel()}
+# ═══════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════
+simulations ={
+    "MQTT": {"left": TumorModel(15, 10.0), "right": TumorModel(16.5, 12.0)},
+    "gRPC": {"left": TumorModel(15, 10.0), "right": TumorModel(16.5, 12.0)},
+    "ZMQ": {"left": TumorModel(15, 10.0), "right": TumorModel(16.5, 12.0)}
 }
-# Lock separati per non influenzare le performance tra protocolli
 locks = {
     "MQTT": threading.Lock(),
-    "ZMQ":  threading.Lock(),
-    "GRPC": threading.Lock()
+    "gRPC": threading.Lock(),
+    "ZMQ": threading.Lock()
 }
-
-# Configurazione Rete
-MQTT_BROKER = os.getenv('BROKER_ADDRESS', '127.0.0.1')
+MQTT_BROKER = os.getenv('BROKER_ADDRESS', 'mosquitto')  # ← FIX 1: Nome container Docker
+MQTT_PORT = 1883
+GRPC_PORT = 50051
 ZMQ_PUB_PORT = 5555
 ZMQ_REP_PORT = 5556
-GRPC_PORT = 50051
 
-# ==========================
-# 3. WORKER MQTT (Loop Indipendente)
-# ==========================
-class MqttPipeline(threading.Thread):
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MQTT WORKER
+# ═══════════════════════════════════════════════════════════════════
+class MqttWorker(threading.Thread):
     def __init__(self):
         threading.Thread.__init__(self)
-        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, "Server_MQTT")
+        self.daemon = True
+        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id = "HybridServer_MQTT")
         self.running = True
+        self.patient_id = "Unknown"
+
+        # Topics
+        self.topic_bootstrap = "digitaltwin/breast/bootstrap"
+        self.topic_pub = "digitaltwin/breast/tumor"
+        self.topic_action = "digitaltwin/breast/action"
 
     def run(self):
         self.client.on_connect = self.on_connect
         self.client.on_message = self.on_message
+
         try:
-            self.client.connect(MQTT_BROKER, 1883, 60)
+            print(f"[MQTT] Connecting to {MQTT_BROKER}:{MQTT_PORT}...")
+            self.client.connect(MQTT_BROKER, MQTT_PORT, 60)
             self.client.loop_start()
-            
+
             while self.running:
-                # 1. CALCOLO (Simulazione carico CPU per MQTT)
+                # Update and publish
                 with locks["MQTT"]:
                     l_data = simulations["MQTT"]["left"].update()
                     r_data = simulations["MQTT"]["right"].update()
-                
-                # 2. TRASMISSIONE
+
                 payload = {
                     "type": "TUMOR_STATE",
-                    "tumors": {"left": l_data, "right": r_data},
-                    "timestamp": time.time()
+                    "timestamp": time.time(),
+                    "tumors": {
+                        "left": l_data,
+                        "right": r_data
+                    }
                 }
-                self.client.publish("digitaltwin/breast/tumor", json.dumps(payload))
+
+                self.client.publish(self.topic_pub, json.dumps(payload))
+
+                print(f"[MQTT] Running... L: {l_data['radius']:.2f}mm | R: {r_data['radius']:.2f}mm")
+                time.sleep(2.0)
                 
-                time.sleep(0.1) # 10 Hz
         except Exception as e:
             print(f"[MQTT] Error: {e}")
 
-    def on_connect(self, client, userdata, flags, rc, props=None):
-        print(f"[MQTT] Ready.")
-        client.subscribe("digitaltwin/breast/action")
-        client.subscribe("digitaltwin/breast/bootstrap")
+    def on_connect(self, client, userdata, flags, rc, properties=None):
+        print(f"[MQTT] ✓ Connected (rc={rc})")
+        self.client.subscribe(self.topic_bootstrap)
+        self.client.subscribe(self.topic_action)
 
     def on_message(self, client, userdata, msg):
-        payload = json.loads(msg.payload.decode())
-        
-        # BOOTSTRAP: Questo è il segnale di START per TUTTI i protocolli
-        if "bootstrap" in msg.topic:
-            data = payload.get("initial_state", payload)
-            r_l, c_l = data.get("left_tumor_radius", 0.5), data.get("left_tumor_cellularity", 10)
-            r_r, c_r = data.get("right_tumor_radius", 0.5), data.get("right_tumor_cellularity", 10)
+        try:
+            payload = json.loads(msg.payload.decode())
             
-            print(f"[SYSTEM] 🏁 BOOTSTRAP RECEIVED -> Starting ALL Simulations")
-            
-            # Inizializza TUTTE e 3 le simulazioni allo stesso stato iniziale
-            for proto in ["MQTT", "ZMQ", "GRPC"]:
-                with locks[proto]:
-                    simulations[proto]["left"] = TumorModel(r_l, c_l)
-                    simulations[proto]["right"] = TumorModel(r_r, c_r)
+            if msg.topic == self.topic_bootstrap:
+                # ✅ FIX 2: Supporta formato nested e flat
+                if "initial_state" in payload:
+                    data = payload["initial_state"]
+                else:
+                    data = payload
+                
+                r_l = float(data.get("left_radius", data.get("left_tumor_radius", 15.0)))
+                c_l = float(data.get("left_cellularity", data.get("left_tumor_cellularity", 10.0)))
+                r_r = float(data.get("right_radius", data.get("right_tumor_radius", 16.5)))
+                c_r = float(data.get("right_cellularity", data.get("right_tumor_cellularity", 12.0)))
+                
+                p_id = payload.get("patient_id", "Unknown")
+                
+                print(f"\n{'='*60}")
+                print(f"[MQTT] 🏁 Bootstrap received")
+                print(f"  Patient: {p_id}")
+                print(f"  Left:  R={r_l:.2f}, C={c_l:.2f}")
+                print(f"  Right: R={r_r:.2f}, C={c_r:.2f}")
+                print(f"{'='*60}\n")
+                
+                with locks["MQTT"]:
+                    simulations["MQTT"]["left"] = TumorModel(r_l, c_l)
+                    simulations["MQTT"]["right"] = TumorModel(r_r, c_r)
+                    self.patient_id = p_id
 
-        # ACTION: Colpisce SOLO la simulazione MQTT
-        elif "action" in msg.topic:
-            amt = float(payload.get("amount", 0))
-            with locks["MQTT"]:
-                print(f"[MQTT] 💉 Injecting {amt}mg")
-                simulations["MQTT"]["left"].inject(amt)
-                simulations["MQTT"]["right"].inject(amt)
+            elif msg.topic == self.topic_action:
+                # ✅ FIX 3: Supporta sia "amount" che "dosage"
+                amount = float(payload.get("amount", payload.get("dosage", 0)))
+                
+                print(f"[MQTT] 💉 Therapy: {amount}mg")
+                
+                with locks["MQTT"]:
+                    simulations["MQTT"]["left"].inject_drug(amount)
+                    simulations["MQTT"]["right"].inject_drug(amount)
+                    
+        except Exception as e:
+            print(f"[MQTT] Error processing message: {e}")
 
-# ==========================
-# 4. WORKER ZEROMQ (Loop Indipendente)
-# ==========================
-class ZmqPipeline(threading.Thread):
+# ═══════════════════════════════════════════════════════════════════
+# ZMQ WORKER
+# ═══════════════════════════════════════════════════════════════════
+class ZmqWorker(threading.Thread):
     def __init__(self):
         threading.Thread.__init__(self)
+        self.daemon = True
+        self.running = True  # ← FIX 4: Aggiunto attributo mancante!
         self.context = zmq.Context()
-        self.running = True
+        self.pub_socket = self.context.socket(zmq.PUB)
+        self.rep_socket = self.context.socket(zmq.REP)
+        self.patient_id = "Unknown"
 
     def run(self):
-        pub = self.context.socket(zmq.PUB)
-        pub.bind(f"tcp://0.0.0.0:{ZMQ_PUB_PORT}")
+        self.pub_socket.bind(f"tcp://0.0.0.0:{ZMQ_PUB_PORT}")
+        self.rep_socket.bind(f"tcp://0.0.0.0:{ZMQ_REP_PORT}")
         
-        rep = self.context.socket(zmq.REP)
-        rep.bind(f"tcp://0.0.0.0:{ZMQ_REP_PORT}")
         poller = zmq.Poller()
-        poller.register(rep, zmq.POLLIN)
-
-        print(f"[ZMQ] Ready (PUB:{ZMQ_PUB_PORT}, REP:{ZMQ_REP_PORT})")
+        poller.register(self.rep_socket, zmq.POLLIN)
+        
+        print(f"[ZMQ] ✓ Ready (PUB:{ZMQ_PUB_PORT}, REP:{ZMQ_REP_PORT})")
 
         while self.running:
-            # 1. CALCOLO (Simulazione carico CPU per ZMQ)
+            # Update and publish
             with locks["ZMQ"]:
                 l_data = simulations["ZMQ"]["left"].update()
                 r_data = simulations["ZMQ"]["right"].update()
 
-            # 2. TRASMISSIONE
+            # ✅ FIX 5: Formato compatibile con Unity
             payload = {
-                "type": "TUMOR_STATE", 
+                "type": "TUMOR_STATE",
                 "timestamp": time.time(),
-                "tumors": {"left": l_data, "right": r_data}
+                "left": l_data,
+                "right": r_data
             }
-            pub.send_string(f"tumor {json.dumps(payload)}")
-
-            # 3. RICEZIONE COMANDI (Colpisce SOLO ZMQ)
-            socks = dict(poller.poll(10))
-            if rep in socks:
-                msg = rep.recv_json()
-                amt = float(msg.get("amount", 0))
-                with locks["ZMQ"]:
-                    print(f"[ZMQ] 💉 Injecting {amt}mg")
-                    simulations["ZMQ"]["left"].inject(amt)
-                    simulations["ZMQ"]["right"].inject(amt)
-                rep.send_json({"status": "OK"})
             
-            time.sleep(0.04) # 25 Hz (ZMQ è più veloce)
+            # Multipart: [topic, json]
+            self.pub_socket.send_multipart([
+                b"tumor_updates",
+                json.dumps(payload).encode()
+            ])
+            print(f"[ZMQ] Running... L: {l_data['radius']:.2f}mm | R: {r_data['radius']:.2f}mm")
+            # Check for commands
+            socks = dict(poller.poll(10))
+            if self.rep_socket in socks:
+                try:
+                    message = self.rep_socket.recv_json()
+                    
+                    if message.get("type") == "BOOTSTRAP":
+                        r_l = float(message.get("left_tumor_radius", message.get("left_radius", 15.0)))
+                        c_l = float(message.get("left_tumor_cellularity", message.get("left_cellularity", 10.0)))
+                        r_r = float(message.get("right_tumor_radius", message.get("right_radius", 16.5)))
+                        c_r = float(message.get("right_tumor_cellularity", message.get("right_cellularity", 12.0)))
+                        p_id = message.get("patient_id", "Unknown")
+                        
+                        print(f"\n{'='*60}")
+                        print(f"[ZMQ] 🏁 Bootstrap received")
+                        print(f"  Patient: {p_id}")
+                        print(f"  Left:  R={r_l:.2f}, C={c_l:.2f}")
+                        print(f"  Right: R={r_r:.2f}, C={c_r:.2f}")
+                        print(f"{'='*60}\n")
+                        
+                        with locks["ZMQ"]:
+                            simulations["ZMQ"]["left"] = TumorModel(r_l, c_l)
+                            simulations["ZMQ"]["right"] = TumorModel(r_r, c_r)
+                            self.patient_id = p_id
+                        
+                        self.rep_socket.send_json({"status": "OK", "message": "Bootstrap successful"})
+                    
+                    elif message.get("type") == "INJECT":
+                        amount = float(message.get("dosage", message.get("amount", 0)))
+                        
+                        print(f"[ZMQ] 💉 Therapy: {amount}mg")
+                        
+                        with locks["ZMQ"]:
+                            simulations["ZMQ"]["left"].inject_drug(amount)
+                            simulations["ZMQ"]["right"].inject_drug(amount)
+                        
+                        self.rep_socket.send_json({"status": "OK"})
+                    
+                    else:
+                        self.rep_socket.send_json({"status": "ERROR", "message": "Unknown command"})
+                        
+                except Exception as e:
+                    print(f"[ZMQ] Command error: {e}")
+                    self.rep_socket.send_json({"status": "ERROR", "message": str(e)})
 
-# ==========================
-# 5. WORKER GRPC (Simulazione Fisica + Servizio)
-# ==========================
-# gRPC ha bisogno di un thread separato per calcolare la fisica
-# altrimenti il tumore cresce solo quando il client chiede dati.
-class GrpcPhysicsLoop(threading.Thread):
-    def run(self):
-        while True:
-            with locks["GRPC"]:
-                simulations["GRPC"]["left"].update()
-                simulations["GRPC"]["right"].update()
-            time.sleep(0.1) # 10 Hz Update Rate
+            time.sleep(0.04)  # 25Hz
 
+# ═══════════════════════════════════════════════════════════════════
+# gRPC SERVICE
+# ═══════════════════════════════════════════════════════════════════
 class GrpcService(breast_dt_pb2_grpc.DigitalTwinServiceServicer):
+    def __init__(self):
+        self.left = TumorModel(15.0, 10.0)
+        self.right = TumorModel(16.5, 12.0)
+        self.running = False
+        self.patient_id = "Unknown"
+        print("[gRPC] Service initialized, waiting for bootstrap...")
+
+    def SendBootstrap(self, request, context):
+        p_id = request.patient_id
+        r_l = request.left_radius
+        c_l = request.left_cellularity
+        r_r = request.right_radius
+        c_r = request.right_cellularity
+        
+        print(f"\n{'='*60}")
+        print(f"[gRPC] 🏁 Bootstrap received")
+        print(f"  Patient: {p_id}")
+        print(f"  Left:  R={r_l:.2f}, C={c_l:.2f}")
+        print(f"  Right: R={r_r:.2f}, C={c_r:.2f}")
+        print(f"{'='*60}\n")
+        
+        self.left = TumorModel(r_l, c_l)
+        self.right = TumorModel(r_r, c_r)
+        self.running = True
+        self.patient_id = p_id
+        
+        # ✅ FIX 6: Ritorna Response (non BootstrapResponse)
+        return breast_dt_pb2.Response(success=True, message="Bootstrap successful")
+
     def StreamTumorUpdates(self, request, context):
-        print("[gRPC] Stream Start")
-        while context.is_active():
-            with locks["GRPC"]:
-                l = simulations["GRPC"]["left"]
-                r = simulations["GRPC"]["right"]
-                # Leggiamo lo stato calcolato dal thread GrpcPhysicsLoop
-                msg = breast_dt_pb2.TumorState(
-                    timestamp=time.time(),
-                    left=breast_dt_pb2.TumorData(radius=l.radius, status="active"),
-                    right=breast_dt_pb2.TumorData(radius=r.radius, status="active")
-                )
-            yield msg
-            time.sleep(0.1) # Transmission Rate
+        print("[gRPC] Stream started")
+        self.running = True
+
+        while self.running and context.is_active():
+            # Update models
+            r_l = self.left.update()
+            r_r = self.right.update()
+
+            left_data = breast_dt_pb2.TumorData(
+                radius=r_l["radius"],
+                cellularity=r_l["cellularity"],
+                drug_level=r_l["drug_level"],
+                status=r_l["status"]
+            )
+            
+            right_data = breast_dt_pb2.TumorData(
+                radius=r_r["radius"],
+                cellularity=r_r["cellularity"],
+                drug_level=r_r["drug_level"],
+                status=r_r["status"]
+            )
+
+            response = breast_dt_pb2.TumorState(
+                timestamp=time.time(),
+                left=left_data,
+                right=right_data
+            )
+            
+            yield response
+            time.sleep(1)
+
+        print("[gRPC] Stream stopped")
 
     def SendTherapy(self, request, context):
-        with locks["GRPC"]:
-            print(f"[gRPC] 💉 Injecting {request.dosage}mg")
-            simulations["GRPC"]["left"].inject(request.dosage)
-            simulations["GRPC"]["right"].inject(request.dosage)
-        return breast_dt_pb2.Response(success=True, message="OK")
+        amount = request.dosage
+        
+        print(f"[gRPC] 💉 Therapy: {amount}mg")
+        
+        self.left.inject_drug(amount)
+        self.right.inject_drug(amount)
+        
+        return breast_dt_pb2.Response(success=True, message="Therapy applied")
 
-    # Il Bootstrap gRPC è opzionale se usiamo MQTT per startare tutto
-    # Ma se lo usiamo, inizializza SOLO la parte gRPC (o tutte, scelta tua)
-    def SendBootstrap(self, req, ctx):
-        # Per coerenza, facciamo che anche questo resetta tutti
-        # (omesso per brevità, assumiamo start da MQTT Physical Twin)
-        return breast_dt_pb2.Response(success=True)
-
+# ═══════════════════════════════════════════════════════════════════
+# GRPC STARTUP
+# ═══════════════════════════════════════════════════════════════════
 def start_grpc():
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     breast_dt_pb2_grpc.add_DigitalTwinServiceServicer_to_server(GrpcService(), server)
     server.add_insecure_port(f'[::]:{GRPC_PORT}')
-    print(f"[gRPC] Listening on {GRPC_PORT}")
+    
+    print(f"[gRPC] ✓ Listening on port {GRPC_PORT}")
+    
     server.start()
-    server.wait_for_termination()
-
-# ==========================
-# MAIN
-# ==========================
-if __name__ == '__main__':
-    print("--- UNIVERSAL SERVER (3 INDEPENDENT PIPELINES) ---")
-
-    # Avvia i 3 motori paralleli
-    MqttPipeline().start()
-    ZmqPipeline().start()
-    GrpcPhysicsLoop().start() # Fisica indipendente per gRPC
-
+    
     try:
-        start_grpc() # Bloccante
+        server.wait_for_termination()
     except KeyboardInterrupt:
-        pass
+        print("\n[gRPC] Stopping...")
+        server.stop(0)
+
+# ═══════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════
+if __name__ == '__main__':
+    print("\n" + "="*60)
+    print("🔷 HYBRID DIGITAL TWIN SERVER")
+    print("="*60)
+    print("Protocols: MQTT | gRPC | ZeroMQ")
+    print("Ports: 1883 | 50051 | 5555/5556")
+    print("="*60 + "\n")
+
+    # Start MQTT worker
+    mqtt_thread = MqttWorker()
+    mqtt_thread.start()
+
+    # Start ZMQ worker
+    zmq_thread = ZmqWorker()
+    zmq_thread.start()
+
+    print("[SYSTEM] All workers started")
+    print("[SYSTEM] Waiting for bootstrap...\n")
+
+    # Start gRPC (blocking)
+    try:
+        start_grpc()
+    except KeyboardInterrupt:
+        print("\n[SYSTEM] Shutdown requested")
