@@ -54,8 +54,8 @@ T_PUB       = "digitaltwin/breast/tumor"
 T_ACTION    = "digitaltwin/breast/action"
 PUBLISH_HZ  = float(os.getenv("PUBLISH_HZ", 0.5))
 
-left  = TumorModel(15.0, 10.0)
-right = TumorModel(16.5, 12.0)
+left  = None
+right = None
 bootstrapped = False
 
 # ═══════════════════════════════════════════════════════════════════
@@ -63,7 +63,7 @@ bootstrapped = False
 # ═══════════════════════════════════════════════════════════════════
 def on_connect(client, userdata, flags, rc, props=None):
     ok = (rc == 0 or str(rc) == "ReasonCode.SUCCESS")
-    print(f"[MQTT-SERVER] {'✓ Connected' if ok else f'✗ rc={rc}'}")
+    print(f"[MQTT-SERVER] {'Connected' if ok else f' not connected rc={rc}'}")
     if ok:
         client.subscribe(T_BOOTSTRAP)
         client.subscribe(T_ACTION)
@@ -120,7 +120,14 @@ def main():
 
     interval = 1.0 / PUBLISH_HZ
 
+    print("[MQTT-SERVER] ⏳ Waiting for bootstrap from Windows...")
+    
     while True:
+        
+        if not bootstrapped or left is None or right is None:
+            time.sleep(0.5)
+            continue
+        
         l_data = left.update()
         r_data = right.update()
 
@@ -131,8 +138,7 @@ def main():
         }
         client.publish(T_PUB, json.dumps(payload))
 
-        flag = "🏃" if bootstrapped else "⏳"
-        print(f"[MQTT] {flag} L:{l_data['radius']:.4f}mm ({l_data['status']}) "
+        print(f"[MQTT] L:{l_data['radius']:.4f}mm ({l_data['status']}) "
               f"| R:{r_data['radius']:.4f}mm ({r_data['status']})")
 
         time.sleep(interval)
