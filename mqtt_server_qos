@@ -5,30 +5,40 @@ import json
 import paho.mqtt.client as mqtt
 
 # ═══════════════════════════════════════════════════════════════════
+# QoS CONFIGURATION  ← modifica solo questo valore: 0, 1 oppure 2
+# ═══════════════════════════════════════════════════════════════════
+QOS_LEVEL = 0
+
+# ═══════════════════════════════════════════════════════════════════
 # TUMOR MODEL
 # ═══════════════════════════════════════════════════════════════════
 class TumorModel:
     def __init__(self, r, c):
-        self.radius = max(0.1, float(r))
-        self.alpha  = float(c) * 0.005
-        self.k      = 30.0
+        self.radius       = max(0.1, float(r))
+        self.alpha        = float(c) * 0.005
+        self.k            = 30.0
         self.drug_efficacy = 0.0
-        self.drug_decay    = 0.02
-        self.emax          = 0.05
-        self.ic50          = 0.2 * max(1.0, 1.0 + float(c) / 20.0)
-        self.last_update   = time.time()
+        self.drug_decay   = 0.02
+        self.emax         = 0.05
+        self.ic50         = 0.2 * max(1.0, 1.0 + float(c) / 20.0)
+        self.last_update  = time.time()
 
     def update(self):
-        now = time.time()
-        dt  = min(now - self.last_update, 2.0)
+        now  = time.time()
+        dt   = min(now - self.last_update, 2.0)
         self.last_update = now
 
-        growth = (self.alpha * self.radius * math.log(self.k / self.radius)
-                  if 0 < self.radius < self.k else 0.0)
-        death  = 0.0
+        growth = (
+            self.alpha * self.radius * math.log(self.k / self.radius)
+            if 0 < self.radius < self.k else 0.0
+        )
+
+        death = 0.0
         if self.drug_efficacy > 0:
-            death = (self.emax * self.radius * self.drug_efficacy
-                     / (self.ic50 + self.drug_efficacy)) * self.radius
+            death = (
+                self.emax * self.radius * self.drug_efficacy
+                / (self.ic50 + self.drug_efficacy)
+            ) * self.radius
 
         self.radius = max(0.1, min(self.radius + (growth - death) * dt, self.k))
 
@@ -51,15 +61,13 @@ class TumorModel:
 # ═══════════════════════════════════════════════════════════════════
 BROKER      = os.getenv("BROKER_ADDRESS", "mosquitto")
 PORT        = int(os.getenv("BROKER_PORT", 1883))
-MQTT_QOS    = int(os.getenv("MQTT_QOS", 0))   # 👈 QoS configurabile
-
 T_BOOTSTRAP = "digitaltwin/breast/bootstrap"
 T_PUB       = "digitaltwin/breast/tumor"
 T_ACTION    = "digitaltwin/breast/action"
 PUBLISH_HZ  = float(os.getenv("PUBLISH_HZ", 0.5))
 
-left  = None
-right = None
+left        = None
+right       = None
 bootstrapped = False
 
 
@@ -68,25 +76,22 @@ bootstrapped = False
 # ═══════════════════════════════════════════════════════════════════
 def on_connect(client, userdata, flags, rc, props=None):
     ok = (rc == 0 or str(rc) == "ReasonCode.SUCCESS")
-    print(f"[MQTT-SERVER] {'Connected' if ok else f' not connected rc={rc}'}")
-
+    print(f"[MQTT-SERVER] {'Connected' if ok else f'not connected rc={rc}'}")
     if ok:
-        client.subscribe(T_BOOTSTRAP, qos=MQTT_QOS)
-        client.subscribe(T_ACTION, qos=MQTT_QOS)
+        client.subscribe(T_BOOTSTRAP, qos=QOS_LEVEL)
+        client.subscribe(T_ACTION,    qos=QOS_LEVEL)
 
 
 def on_message(client, userdata, msg):
     global left, right, bootstrapped
-
     try:
         payload = json.loads(msg.payload.decode())
 
         if msg.topic == T_BOOTSTRAP:
             data = payload.get("initial_state", payload)
-
-            r_l  = float(data.get("left_radius",      data.get("left_tumor_radius",       15.0)))
+            r_l  = float(data.get("left_radius",       data.get("left_tumor_radius",       15.0)))
             c_l  = float(data.get("left_cellularity",  data.get("left_tumor_cellularity",  10.0)))
-            r_r  = float(data.get("right_radius",     data.get("right_tumor_radius",       16.5)))
+            r_r  = float(data.get("right_radius",      data.get("right_tumor_radius",      16.5)))
             c_r  = float(data.get("right_cellularity", data.get("right_tumor_cellularity", 12.0)))
             p_id = payload.get("patient_id", "Unknown")
 
@@ -104,7 +109,6 @@ def on_message(client, userdata, msg):
             amount = float(payload.get("amount", payload.get("dosage", 0)))
             left.inject_drug(amount)
             right.inject_drug(amount)
-
             print(f"[MQTT-SERVER] 💉 Therapy: {amount}mg")
 
     except Exception as e:
@@ -115,17 +119,16 @@ def on_message(client, userdata, msg):
 # MAIN
 # ═══════════════════════════════════════════════════════════════════
 def main():
-
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="MqttServer")
     client.on_connect = on_connect
     client.on_message = on_message
 
     print(f"\n{'='*50}")
-    print("🔵  MQTT SERVER")
-    print(f"    Broker : {BROKER}:{PORT}")
-    print(f"    QoS    : {MQTT_QOS}")
-    print(f"    Topic  : {T_PUB}")
-    print(f"    Rate   : {PUBLISH_HZ} msg/s")
+    print(f"🔵 MQTT SERVER")
+    print(f"  Broker  : {BROKER}:{PORT}")
+    print(f"  Topic   : {T_PUB}")
+    print(f"  Rate    : {PUBLISH_HZ} msg/s")
+    print(f"  QoS     : {QOS_LEVEL}")          # ← mostra il QoS attivo all'avvio
     print(f"{'='*50}\n")
 
     client.connect(BROKER, PORT, 60)
@@ -133,10 +136,9 @@ def main():
 
     interval = 1.0 / PUBLISH_HZ
 
-    print("[MQTT-SERVER] ⏳ Waiting for bootstrap...")
+    print("[MQTT-SERVER] ⏳ Waiting for bootstrap from Windows...")
 
     while True:
-
         if not bootstrapped or left is None or right is None:
             time.sleep(0.5)
             continue
@@ -150,8 +152,7 @@ def main():
             "tumors":    {"left": l_data, "right": r_data}
         }
 
-        client.publish(T_PUB, json.dumps(payload), qos=MQTT_QOS)
-
+        client.publish(T_PUB, json.dumps(payload), qos=QOS_LEVEL)
         time.sleep(interval)
 
 
