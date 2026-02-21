@@ -138,10 +138,10 @@ def main():
         }
         client.publish(T_PUB, json.dumps(payload))
 
-        print(f"[MQTT] L:{l_data['radius']:.4f}mm ({l_data['status']}) "
-              f"| R:{r_data['radius']:.4f}mm ({r_data['status']})")
+       # print(f"[MQTT] L:{l_data['radius']:.4f}mm ({l_data['status']}) "
+        #      f"| R:{r_data['radius']:.4f}mm ({r_data['status']})")
 
-        time.sleep(interval)
+       # time.sleep(interval)
 
 if __name__ == "__main__":
     main()
