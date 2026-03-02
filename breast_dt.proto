@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package breast_dt;
+
+
+service DigitalTwinService {
+
+  rpc SendBootstrap (BootstrapRequest) returns (Response) {}
+
+
+  rpc StreamTumorUpdates (Empty) returns (stream TumorState) {}
+
+
+  rpc SendTherapy (TherapyRequest) returns (Response) {}
+}
+
+
+
+message Empty {}
+
+message Response {
+  bool success = 1;
+  string message = 2;
+}
+
+message BootstrapRequest {
+  string patient_id = 1;
+  float left_radius = 2;
+  float left_cellularity = 3;
+  float right_radius = 4;
+  float right_cellularity = 5;
+}
+
+message TumorData {
+  float radius = 1;
+  float cellularity = 2;
+  float drug_level = 3;
+  string status = 4;
+}
+
+message TumorState {
+  double timestamp = 1;
+  TumorData left = 2;
+  TumorData right = 3;
+}
+
+message TherapyRequest {
+  string type = 1;
+  float dosage = 2;
+}
