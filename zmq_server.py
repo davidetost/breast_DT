@@ -43,7 +43,7 @@ class TumorModel:
 
 PUB_PORT   = int(os.getenv("ZMQ_PUB_PORT", 5555))
 REP_PORT   = int(os.getenv("ZMQ_REP_PORT", 5556))
-PUBLISH_HZ = float(os.getenv("PUBLISH_HZ", 1.0))
+PUBLISH_HZ = float(os.getenv("PUBLISH_HZ", 50))
 
 def main():
     left  = None
