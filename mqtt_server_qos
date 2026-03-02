@@ -1,350 +1,146 @@
-#!/usr/bin/env python3
-"""
-Server MQTT per simulazione progressione tumorale
-con supporto configurabile QoS 0, 1, 2
-"""
-
-import paho.mqtt.client as mqtt
-import json
 import time
-import logging
-import argparse
-from dataclasses import dataclass
-from typing import Optional
-import sys
+import os
+import math
+import json
+import paho.mqtt.client as mqtt
 
-# Configurazione logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
 
-@dataclass
-class MQTTConfig:
-    """Configurazione server MQTT"""
-    broker_host: str = "0.0.0.0"
-    broker_port: int = 1883
-    qos_level: int = 0  # 0, 1, o 2
-    client_id: str = "tumor_simulator_server"
-    
-    # Topics
-    bootstrap_topic: str = "tumor/bootstrap"
-    update_topic: str = "tumor/updates"
-    control_topic: str = "tumor/control"
-    
-    # Simulazione
-    simulation_interval: float = 0.1  # secondi tra aggiornamenti
-    max_iterations: int = 1000
+class TumorModel:
+    def __init__(self, r, c):
+        self.radius = max(0.1, float(r))
+        self.alpha  = float(c) * 0.005
+        self.k      = 30.0
+        self.drug_efficacy = 0.0
+        self.drug_decay    = 0.02
+        self.emax          = 0.05
+        self.ic50          = 0.2 * max(1.0, 1.0 + float(c) / 20.0)
+        self.last_update   = time.time()
 
-class TumorSimulatorMQTT:
-    """Server MQTT per simulazione progressione tumorale"""
-    
-    def __init__(self, config: MQTTConfig):
-        self.config = config
-        self.client = mqtt.Client(client_id=config.client_id)
-        self.is_running = False
-        self.bootstrap_data = None
-        self.iteration_count = 0
-        
-        # Statistiche QoS
-        self.messages_sent = 0
-        self.messages_acked = 0  # Solo per QoS 1 e 2
-        
-        # Setup callbacks
-        self.client.on_connect = self.on_connect
-        self.client.on_message = self.on_message
-        self.client.on_publish = self.on_publish
-        self.client.on_disconnect = self.on_disconnect
-        
-        logger.info(f"Server MQTT inizializzato con QoS {config.qos_level}")
-        self._print_qos_info()
-    
-    def _print_qos_info(self):
-        """Stampa informazioni sul livello QoS configurato"""
-        qos_descriptions = {
-            0: "At most once - Nessuna conferma, massima velocità, possibile perdita messaggi",
-            1: "At least once - Conferma ricezione, possibili duplicati, buon bilanciamento",
-            2: "Exactly once - Handshake a 4 vie, nessuna perdita/duplicato, massima affidabilità"
+    def update(self):
+        now = time.time()
+        dt  = min(now - self.last_update, 2.0)
+        self.last_update = now
+
+        growth = (self.alpha * self.radius * math.log(self.k / self.radius)
+                  if 0 < self.radius < self.k else 0.0)
+        death  = 0.0
+        if self.drug_efficacy > 0:
+            death = (self.emax * self.radius * self.drug_efficacy
+                     / (self.ic50 + self.drug_efficacy)) * self.radius
+
+        self.radius = max(0.1, min(self.radius + (growth - death) * dt, self.k))
+        if self.drug_efficacy > 0:
+            self.drug_efficacy = max(0.0, self.drug_efficacy - self.drug_decay * dt)
+
+        return {
+            "radius":      round(self.radius, 4),
+            "cellularity": round(self.alpha * 100, 2),
+            "drug_level":  round(self.drug_efficacy, 4),
+            "status":      "growing" if growth > death else "shrinking"
         }
-        
-        logger.info("="*70)
-        logger.info(f"QoS Level: {self.config.qos_level}")
-        logger.info(f"Descrizione: {qos_descriptions[self.config.qos_level]}")
-        logger.info("="*70)
-    
-    def on_connect(self, client, userdata, flags, rc):
-        """Callback connessione stabilita"""
-        if rc == 0:
-            logger.info("✓ Connesso al broker MQTT")
-            
-            # Subscribe ai topic con il QoS configurato
-            client.subscribe(self.config.bootstrap_topic, qos=self.config.qos_level)
-            client.subscribe(self.config.control_topic, qos=self.config.qos_level)
-            
-            logger.info(f"✓ Sottoscritto a {self.config.bootstrap_topic} (QoS {self.config.qos_level})")
-            logger.info(f"✓ Sottoscritto a {self.config.control_topic} (QoS {self.config.qos_level})")
-        else:
-            logger.error(f"✗ Connessione fallita con codice {rc}")
-    
-    def on_disconnect(self, client, userdata, rc):
-        """Callback disconnessione"""
-        if rc != 0:
-            logger.warning(f"Disconnessione inattesa: {rc}")
-    
-    def on_publish(self, client, userdata, mid):
-        """Callback messaggio pubblicato (utile per QoS 1 e 2)"""
-        self.messages_acked += 1
-        
-        if self.config.qos_level > 0 and self.messages_acked % 100 == 0:
-            logger.debug(f"Messaggi confermati: {self.messages_acked}/{self.messages_sent}")
-    
-    def on_message(self, client, userdata, msg):
-        """Callback ricezione messaggio"""
-        topic = msg.topic
-        
-        try:
-            payload = json.loads(msg.payload.decode())
-            
-            if topic == self.config.bootstrap_topic:
-                self.handle_bootstrap(payload)
-            elif topic == self.config.control_topic:
-                self.handle_control(payload)
-                
-        except json.JSONDecodeError as e:
-            logger.error(f"Errore decodifica JSON: {e}")
-        except Exception as e:
-            logger.error(f"Errore gestione messaggio: {e}")
-    
-    def handle_bootstrap(self, data):
-        """Gestisce messaggio di bootstrap iniziale"""
-        logger.info("📥 Ricevuto bootstrap dal client")
-        logger.info(f"   Dati: {len(str(data))} bytes")
-        
-        self.bootstrap_data = data
-        self.iteration_count = 0
-        
-        # Avvia simulazione
-        if not self.is_running:
-            self.is_running = True
-            self.run_simulation()
-    
-    def handle_control(self, data):
-        """Gestisce messaggi di controllo"""
-        command = data.get('command', '')
-        
-        if command == 'stop':
-            logger.info("📥 Ricevuto comando STOP")
-            self.is_running = False
-        elif command == 'pause':
-            logger.info("📥 Ricevuto comando PAUSE")
-            # Implementa logica di pausa se necessario
-    
-    def generate_tumor_update(self, iteration: int):
-        """Genera dati di aggiornamento progressione tumorale"""
-        # Simula progressione basata sui dati di bootstrap
-        # (Implementa qui la tua logica specifica)
-        
-        update = {
-            'iteration': iteration,
-            'timestamp': time.time(),
-            'tumor_data': {
-                'size': 1.0 + (iteration * 0.01),  # Esempio: crescita lineare
-                'position': self.bootstrap_data.get('initial_position', [0, 0, 0]),
-                'density': 0.8 + (iteration * 0.001)
-            },
-            'qos_level': self.config.qos_level  # Include QoS per debug
-        }
-        
-        return update
-    
-    def publish_update(self, data: dict) -> bool:
-        """Pubblica aggiornamento con il QoS configurato"""
-        try:
-            payload = json.dumps(data)
-            
-            # Pubblica con il QoS configurato
-            result = self.client.publish(
-                self.config.update_topic,
-                payload,
-                qos=self.config.qos_level,
-                retain=False
-            )
-            
-            self.messages_sent += 1
-            
-            # Per QoS 0, result.rc è immediato
-            # Per QoS 1 e 2, il callback on_publish confermerà
-            if result.rc == mqtt.MQTT_ERR_SUCCESS:
-                return True
-            else:
-                logger.warning(f"Publish fallito: {result.rc}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Errore pubblicazione: {e}")
-            return False
-    
-    def run_simulation(self):
-        """Esegue il ciclo di simulazione"""
-        logger.info("🚀 Avvio simulazione progressione tumorale")
-        logger.info(f"   Intervallo: {self.config.simulation_interval}s")
-        logger.info(f"   Max iterazioni: {self.config.max_iterations}")
-        logger.info(f"   QoS: {self.config.qos_level}")
-        
-        start_time = time.time()
-        
-        while self.is_running and self.iteration_count < self.config.max_iterations:
-            # Genera e invia aggiornamento
-            update = self.generate_tumor_update(self.iteration_count)
-            
-            if self.publish_update(update):
-                self.iteration_count += 1
-                
-                # Log ogni 100 iterazioni
-                if self.iteration_count % 100 == 0:
-                    elapsed = time.time() - start_time
-                    rate = self.iteration_count / elapsed if elapsed > 0 else 0
-                    logger.info(f"📊 Iterazione {self.iteration_count} - "
-                              f"Rate: {rate:.1f} msg/s - "
-                              f"QoS {self.config.qos_level}")
-            
-            # Attendi intervallo configurato
-            time.sleep(self.config.simulation_interval)
-        
-        # Statistiche finali
-        self.print_statistics(start_time)
-        self.is_running = False
-    
-    def print_statistics(self, start_time: float):
-        """Stampa statistiche finali"""
-        elapsed = time.time() - start_time
-        
-        logger.info("="*70)
-        logger.info("STATISTICHE SIMULAZIONE")
-        logger.info("="*70)
-        logger.info(f"QoS Level: {self.config.qos_level}")
-        logger.info(f"Iterazioni completate: {self.iteration_count}")
-        logger.info(f"Messaggi inviati: {self.messages_sent}")
-        logger.info(f"Messaggi confermati: {self.messages_acked}")
-        logger.info(f"Tempo totale: {elapsed:.2f}s")
-        logger.info(f"Throughput medio: {self.messages_sent / elapsed:.2f} msg/s")
-        
-        if self.config.qos_level > 0:
-            ack_rate = (self.messages_acked / self.messages_sent * 100) if self.messages_sent > 0 else 0
-            logger.info(f"Tasso conferma: {ack_rate:.1f}%")
-        
-        logger.info("="*70)
-    
-    def start(self):
-        """Avvia il server"""
-        try:
-            logger.info(f"Connessione al broker {self.config.broker_host}:{self.config.broker_port}")
-            self.client.connect(self.config.broker_host, self.config.broker_port, 60)
-            
-            # Loop infinito gestione messaggi
-            self.client.loop_forever()
-            
-        except KeyboardInterrupt:
-            logger.info("\n⚠️  Interruzione da tastiera")
-            self.stop()
-        except Exception as e:
-            logger.error(f"Errore fatale: {e}")
-            self.stop()
-    
-    def stop(self):
-        """Ferma il server"""
-        logger.info("Arresto server...")
-        self.is_running = False
-        self.client.disconnect()
-        logger.info("✓ Server arrestato")
+
+    def inject_drug(self, amount):
+        self.drug_efficacy = min(2.0, self.drug_efficacy + float(amount))
+
+
+BROKER      = os.getenv("BROKER_ADDRESS", "mosquitto")
+PORT        = int(os.getenv("BROKER_PORT", 1883))
+T_BOOTSTRAP = "digitaltwin/breast/bootstrap"
+T_PUB       = "digitaltwin/breast/tumor"
+T_ACTION    = "digitaltwin/breast/action"
+PUBLISH_HZ  = float(os.getenv("PUBLISH_HZ", 50))
+
+QOS_LEVEL   = int(os.getenv("MQTT_QoS", 2))
+
+left  = None
+right = None
+bootstrapped = False
+
+
+def on_connect(client, userdata, flags, rc, props=None):
+    ok = (rc == 0 or str(rc) == "ReasonCode.SUCCESS")
+    print(f"[MQTT-SERVER] {'Connected' if ok else f' not connected rc={rc}'}")
+    if ok:
+        client.subscribe(T_BOOTSTRAP)
+        client.subscribe(T_ACTION)
+
+def on_message(client, userdata, msg):
+    global left, right, bootstrapped
+    try:
+        payload = json.loads(msg.payload.decode())
+
+        if msg.topic == T_BOOTSTRAP:
+            data = payload.get("initial_state", payload)
+            r_l  = float(data.get("left_radius",      data.get("left_tumor_radius",       15.0)))
+            c_l  = float(data.get("left_cellularity",  data.get("left_tumor_cellularity",  10.0)))
+            r_r  = float(data.get("right_radius",     data.get("right_tumor_radius",       16.5)))
+            c_r  = float(data.get("right_cellularity", data.get("right_tumor_cellularity", 12.0)))
+            p_id = payload.get("patient_id", "Unknown")
+
+            left  = TumorModel(r_l, c_l)
+            right = TumorModel(r_r, c_r)
+            bootstrapped = True
+
+            print(f"\n{'='*50}")
+            print(f"[MQTT-SERVER] 🏁 Bootstrap — Patient: {p_id}")
+            print(f"  Left : R={r_l:.2f}mm, C={c_l:.2f}%")
+            print(f"  Right: R={r_r:.2f}mm, C={c_r:.2f}%")
+            print(f"{'='*50}\n")
+
+        elif msg.topic == T_ACTION:
+            amount = float(payload.get("amount", payload.get("dosage", 0)))
+            left.inject_drug(amount)
+            right.inject_drug(amount)
+            print(f"[MQTT-SERVER] 💉 Therapy: {amount}mg")
+
+    except Exception as e:
+        print(f"[MQTT-SERVER] on_message error: {e}")
+
 
 def main():
-    """Entry point con parsing argomenti"""
-    parser = argparse.ArgumentParser(
-        description='Server MQTT simulazione tumorale con QoS configurabile',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Esempi di utilizzo:
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="MqttServer")
+    client.on_connect = on_connect
+    client.on_message = on_message
 
-  # QoS 0 (massima velocità, nessuna garanzia)
-  python mqtt_server_qos.py --qos 0
+    print(f"\n{'='*50}")
+    print(f"🔵  MQTT SERVER")
+    print(f"    Broker : {BROKER}:{PORT}")
+    print(f"    Topic  : {T_PUB}")
+    print(f"    Rate   : {PUBLISH_HZ} msg/s")
+    print(f"    QoS    : {QOS_LEVEL}") 
+    print(f"{'='*50}\n")
 
-  # QoS 1 (almeno una volta, con conferma)
-  python mqtt_server_qos.py --qos 1
+    client.connect(BROKER, PORT, 60)
+    client.loop_start()
 
-  # QoS 2 (esattamente una volta, massima affidabilità)
-  python mqtt_server_qos.py --qos 2
+    interval = 1.0 / PUBLISH_HZ
 
-  # Test con intervallo rapido e QoS 1
-  python mqtt_server_qos.py --qos 1 --interval 0.05 --iterations 2000
+    print("[MQTT-SERVER] ⏳ Waiting for bootstrap from Windows...")
+    
+    while True:
+        
+        if not bootstrapped or left is None or right is None:
+            time.sleep(0.5)
+            continue
+        
+        l_data = left.update()
+        r_data = right.update()
 
-Livelli QoS:
-  0 = At most once  (veloce, possibili perdite)
-  1 = At least once (bilanciato, possibili duplicati)
-  2 = Exactly once  (affidabile, più lento)
-        """
-    )
-    
-    parser.add_argument(
-        '--host',
-        default='0.0.0.0',
-        help='Indirizzo IP broker MQTT (default: 0.0.0.0)'
-    )
-    
-    parser.add_argument(
-        '--port',
-        type=int,
-        default=1883,
-        help='Porta broker MQTT (default: 1883)'
-    )
-    
-    parser.add_argument(
-        '--qos',
-        type=int,
-        choices=[0, 1, 2],
-        default=0,
-        help='Livello QoS MQTT: 0=at most once, 1=at least once, 2=exactly once (default: 0)'
-    )
-    
-    parser.add_argument(
-        '--interval',
-        type=float,
-        default=0.1,
-        help='Intervallo tra aggiornamenti in secondi (default: 0.1)'
-    )
-    
-    parser.add_argument(
-        '--iterations',
-        type=int,
-        default=1000,
-        help='Numero massimo iterazioni (default: 1000)'
-    )
-    
-    parser.add_argument(
-        '--debug',
-        action='store_true',
-        help='Abilita logging dettagliato'
-    )
-    
-    args = parser.parse_args()
-    
-    # Configura logging
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-    
-    # Crea configurazione
-    config = MQTTConfig(
-        broker_host=args.host,
-        broker_port=args.port,
-        qos_level=args.qos,
-        simulation_interval=args.interval,
-        max_iterations=args.iterations
-    )
-    
-    # Avvia server
-    server = TumorSimulatorMQTT(config)
-    server.start()
+        payload = {
+            "type":      "TUMOR_STATE",
+            "timestamp": time.time(),
+            "tumors":    {"left": l_data, "right": r_data}
+        }
+        
+        
+        client.publish(T_PUB, json.dumps(payload), qos=QOS_LEVEL)
+        
+
+        print(f"[MQTT] L:{l_data['radius']:.4f}mm ({l_data['status']}) "
+              f"| R:{r_data['radius']:.4f}mm ({r_data['status']})")
+
+        
+        time.sleep(interval)
 
 if __name__ == "__main__":
     main()
