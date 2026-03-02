@@ -1,1 +1,83 @@
+version: '3.8'
 
+services:
+
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: dt_mosquitto
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf
+    networks:
+      - dt_network
+    restart: unless-stopped 
+
+
+  server-mqtt:
+    build:
+      context: ./servers
+      dockerfile: Dockerfile
+    container_name: dt_server_mqtt
+    command: python -u mqtt_server.py
+    depends_on:
+      - mosquitto
+    environment:
+      - BROKER_HOST=mosquitto
+      - BROKER_PORT=1883
+      - PUBLISH_HZ=50
+      
+    networks:
+      - dt_network
+    restart: unless-stopped
+
+  server-grpc:
+    build:
+      context: ./servers
+      dockerfile: Dockerfile
+    container_name: dt_server_grpc
+    command: python -u gRPC_server.py
+    ports:
+      - "50051:50051"
+    environment:
+      - GRPC_PORT=50051
+      - STREAM_HZ=50    
+    networks:
+      - dt_network
+    restart: unless-stopped
+
+  server-zmq:
+    build:
+      context: ./servers
+      dockerfile: Dockerfile
+    container_name: dt_server_zmq
+    command: python -u zmq_server.py
+    ports:
+      - "5555:5555"
+      - "5556:5556"
+    environment:
+      - ZMQ_PUB_PORT=5555
+      - ZMQ_REP_PORT=5556
+      - PUBLISH_HZ=50    
+    networks:
+      - dt_network
+    restart: unless-stopped
+
+  envoy:
+    image: envoyproxy/envoy:v1.29-latest
+    container_name: dt_envoy
+    ports:
+      - "8080:8080"
+      - "9901:9901"
+    volumes:
+      - ./envoy/envoy.yaml:/etc/envoy/envoy.yaml
+    depends_on:
+      - server-grpc
+    networks:
+      - dt_network
+
+networks:
+  dt_network:
+    driver: bridge
