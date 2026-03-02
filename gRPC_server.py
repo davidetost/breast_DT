@@ -45,7 +45,7 @@ class TumorModel:
         self.drug_efficacy = min(2.0, self.drug_efficacy + float(amount))
 
 GRPC_PORT   = int(os.getenv("GRPC_PORT", 50051))
-STREAM_HZ   = float(os.getenv("STREAM_HZ", 1.0))
+STREAM_HZ   = float(os.getenv("STREAM_HZ", 50))
 
 class GrpcService(breast_dt_pb2_grpc.DigitalTwinServiceServicer):
 
@@ -86,7 +86,7 @@ class GrpcService(breast_dt_pb2_grpc.DigitalTwinServiceServicer):
             r = self.right.update()
 
             print(f"[gRPC] L:{l['radius']:.4f}mm ({l['status']}) "
-                  f"| R:{r['radius']:.4f}mm ({r['status']})")
+                    f"| R:{r['radius']:.4f}mm ({r['status']})")
 
             yield breast_dt_pb2.TumorState(
                 timestamp=time.time(),
